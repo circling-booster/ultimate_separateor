@@ -185,3 +185,5 @@ cython_debug/
 models/
 files/
 studio_output/
+vocals/
+output_split/
