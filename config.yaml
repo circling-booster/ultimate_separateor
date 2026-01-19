@@ -1,0 +1,32 @@
+work_settings:
+  vocal_model_count: 2
+  enable_karaoke: true
+  enable_normalization: true
+  target_peak_db: -1.0
+  temp_format: wav
+
+inference_params:
+  hq_mdx:
+    segment_size: 512
+    overlap: 0.5
+    batch_size: 1
+    enable_denoise: true
+  hq_mdxc:
+    segment_size: 512
+    overlap: 8
+    batch_size: 1
+    override_model_segment_size: true
+
+models:
+  vocal_1: model_bs_roformer_ep_317_sdr_12.9755.ckpt
+  vocal_2: MDX23C-8KFFT-InstVoc_HQ.ckpt
+  karaoke_rof: mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt
+  karaoke_mdx: UVR_MDXNET_KARA_2.onnx
+  dereverb: Reverb_HQ_By_FoxJoy.onnx
+
+weights:
+  karaoke:
+    RoFormer: 1.5
+    MDX: 0.5
+  ensemble_2_model:
+    Balanced: [1.1, 0.9]

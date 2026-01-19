@@ -1,0 +1,10 @@
+# 이미 위에서 수동 설치했으므로 torch, torchaudio는 제외하거나 주석 처리해도 되지만, 
+# 버전 체크를 위해 남겨두되, pip가 기존 설치된 것을 인식하게 둡니다.
+
+numpy
+librosa
+soundfile
+scipy
+audio-separator
+pyyaml
+python-dotenv
