@@ -44,7 +44,6 @@ class ProcessingPipeline:
                 Path(norm_dir).mkdir(exist_ok=True)
                 current_input = normalize_peak(input_path, norm_file, self.cfg['work_settings']['target_peak_db'])
         
-        # 원본 길이 참조용 로드 (Skip 여부와 관계없이 필요)
         y_orig, sr = librosa.load(current_input, sr=None, mono=False)
 
         # ---------------------------------------------------------
@@ -65,9 +64,6 @@ class ProcessingPipeline:
             for name, model_file, sub_dir in models:
                 work_dir = os.path.join(raw_dir, sub_dir)
                 
-                # 서브 모델 결과가 있는지 확인 (재사용)
-                # 주의: 여기서는 Vocals 파일 이름을 추정해야 하므로, 간단히 폴더 내 'Vocals' 키워드 파일 검색
-                # 만약 없다면 추론 실행
                 existing_voc = None
                 if os.path.exists(work_dir):
                     existing_files = os.listdir(work_dir)
@@ -84,17 +80,14 @@ class ProcessingPipeline:
                     voc_path = self.engine.find_file_by_keyword(out_files, "Vocals", work_dir)
                     stem_paths.append(voc_path)
 
-            # Mix Vocals
             print(f"        🔹 Mixing...")
             voc_ens, _ = align_and_mix(stem_paths, self.cfg['weights']['ensemble_2_model']['Balanced'], sr)
-            
-            # Length Fix
             min_len = min(y_orig.shape[-1], voc_ens.shape[-1])
             voc_ens = voc_ens[..., :min_len]
             sf.write(ens_path, voc_ens.T, sr)
 
         # ---------------------------------------------------------
-        # [Step 2] De-Reverb
+        # [Step 2] De-Reverb (Critical Fix Applied)
         # ---------------------------------------------------------
         dry_final_path = os.path.join(raw_dir, '02_Dry_Vocals.wav')
         
@@ -104,7 +97,6 @@ class ProcessingPipeline:
             print(f"    [2/4] De-reverberation...")
             dr_dir = os.path.join(raw_dir, "02_DeReverb")
             
-            # 중간 단계(DeReverb 결과) 확인
             out_dr_files = []
             if os.path.exists(dr_dir):
                  out_dr_files = [f for f in os.listdir(dr_dir) if "No_Reverb" in f]
@@ -112,7 +104,21 @@ class ProcessingPipeline:
             if out_dr_files:
                  dry_path = os.path.join(dr_dir, out_dr_files[0])
             else:
-                 out_dr = self.engine.separate(ens_path, dr_dir, self.cfg['models']['dereverb'])
+                 # [FIX] Reverb 모델은 segment_size=256이 필수입니다.
+                 # 여기서만 명시적으로 override 하여 라이브러리 충돌을 방지합니다.
+                 reverb_overrides = {
+                     "mdx_params": {
+                         "segment_size": 256, 
+                         "overlap": 0.25, 
+                         "batch_size": 1
+                     }
+                 }
+                 out_dr = self.engine.separate(
+                     ens_path, 
+                     dr_dir, 
+                     self.cfg['models']['dereverb'],
+                     **reverb_overrides
+                 )
                  dry_path = self.engine.find_file_by_keyword(out_dr, "No_Reverb", dr_dir)
             
             shutil.copy(dry_path, dry_final_path)
@@ -131,7 +137,7 @@ class ProcessingPipeline:
             shutil.copy(clean_path, final_dest)
 
         # ---------------------------------------------------------
-        # [Step 4] Karaoke Split (Main vs Backing)
+        # [Step 4] Karaoke Split
         # ---------------------------------------------------------
         main_out = os.path.join(song_out_dir, '04_main_vocal.wav')
         back_out = os.path.join(song_out_dir, '04_backing_vocal.wav')
@@ -142,19 +148,16 @@ class ProcessingPipeline:
             else:
                 print(f"    [4/4] Main/Backing Split...")
                 
-                # RoFormer Split
                 dir_rof = os.path.join(raw_dir, "04_A_RoF")
                 main_rof, back_rof = self._get_or_run_karaoke(
                     clean_path, dir_rof, self.cfg['models']['karaoke_rof']
                 )
 
-                # MDX Split
                 dir_mdx = os.path.join(raw_dir, "04_B_MDX")
                 main_mdx, back_mdx = self._get_or_run_karaoke(
                     clean_path, dir_mdx, self.cfg['models']['karaoke_mdx']
                 )
 
-                # Weighted Mix
                 print(f"        🔹 Mixing Karaoke Stems...")
                 w_rof = self.cfg['weights']['karaoke']['RoFormer']
                 w_mdx = self.cfg['weights']['karaoke']['MDX']
@@ -167,29 +170,18 @@ class ProcessingPipeline:
         else:
             print("    [4/4] Skipped (Disabled).")
 
-        # Cleanup (Optional: Only if completely finished and saving artifacts is disabled)
         if str(self.env.get('SAVE_ALL_ARTIFACTS')).lower() != 'true':
-            # 주의: Resume 기능을 위해 삭제 로직은 신중해야 함.
-            # 작업이 완료되었을 때만 삭제하거나, 사용자가 명시적으로 원할 때만 삭제.
-            # 여기서는 안전을 위해 주석 처리하거나, 필요 시 활성화.
-            # shutil.rmtree(raw_dir)
             pass
             
         return song_out_dir
 
     def _get_or_run_karaoke(self, input_path, work_dir, model_file):
-        """Helper to check if karaoke split files already exist"""
-        # 폴더 내에 2개의 파일이 이미 존재하면 그것을 사용 (파일명 정렬로 추정)
-        # 하지만 정확성을 위해 identify_stems 로직을 다시 태우는 것이 안전함.
-        # 분리 자체가 시간 소요가 크므로, 분리 파일이 있으면 로드만 함.
-        
         existing_files = []
         if os.path.exists(work_dir):
             existing_files = [os.path.join(work_dir, f) for f in os.listdir(work_dir) if f.endswith('.wav')]
         
         if len(existing_files) >= 2:
             print(f"        🔹 Using cached output from {os.path.basename(work_dir)}...")
-            # 이미 파일이 있다면 Main/Back 구분 로직만 다시 실행 (매우 빠름)
             return self.engine.identify_stems([os.path.basename(f) for f in existing_files], work_dir, input_path)
         else:
             print(f"        🔹 Running {os.path.basename(work_dir)}...")

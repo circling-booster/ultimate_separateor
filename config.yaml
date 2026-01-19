@@ -7,11 +7,16 @@ work_settings:
 
 inference_params:
   hq_mdx:
-    segment_size: 512
-    overlap: 0.5
+    # [중요 수정] segment_size를 512로 강제하면 Reverb 모델 등에서 충돌이 발생합니다.
+    # 주석 처리하여 라이브러리가 모델별 기본값을 사용하도록 합니다.
+    # segment_size: 512 
+    
+    overlap: 0.25      # 안전하고 빠른 값 (기존 0.5는 Reverb에서 너무 느리거나 메모리 부족 유발 가능)
     batch_size: 1
     enable_denoise: true
+  
   hq_mdxc:
+    # MDXC 모델(Vocal 2: MDX23C)은 512 설정이 유효합니다.
     segment_size: 512
     overlap: 8
     batch_size: 1
