@@ -87,7 +87,7 @@ class ProcessingPipeline:
             sf.write(ens_path, voc_ens.T, sr)
 
         # ---------------------------------------------------------
-        # [Step 2] De-Reverb (Critical Fix Applied)
+        # [Step 2] De-Reverb (Optimized for 512 Dim)
         # ---------------------------------------------------------
         dry_final_path = os.path.join(raw_dir, '02_Dry_Vocals.wav')
         
@@ -103,25 +103,30 @@ class ProcessingPipeline:
             
             if out_dr_files:
                  dry_path = os.path.join(dr_dir, out_dr_files[0])
+                 shutil.copy(dry_path, dry_final_path)
             else:
-                 # [FIX] Reverb 모델은 segment_size=256이 필수입니다.
-                 # 여기서만 명시적으로 override 하여 라이브러리 충돌을 방지합니다.
-                 reverb_overrides = {
-                     "mdx_params": {
-                         "segment_size": 256, 
-                         "overlap": 0.25, 
-                         "batch_size": 1
+                 # [CRITICAL FIX] Reverb 모델 확인 결과 512가 맞음. 
+                 # 512를 강제 주입하여 불일치 방지.
+                 try:
+                     reverb_overrides = {
+                         "mdx_params": {
+                             "segment_size": 512,  # Fixed: 256 -> 512
+                             "overlap": 0.25, 
+                             "batch_size": 1
+                         }
                      }
-                 }
-                 out_dr = self.engine.separate(
-                     ens_path, 
-                     dr_dir, 
-                     self.cfg['models']['dereverb'],
-                     **reverb_overrides
-                 )
-                 dry_path = self.engine.find_file_by_keyword(out_dr, "No_Reverb", dr_dir)
-            
-            shutil.copy(dry_path, dry_final_path)
+                     out_dr = self.engine.separate(
+                         ens_path, 
+                         dr_dir, 
+                         self.cfg['models']['dereverb'],
+                         **reverb_overrides
+                     )
+                     dry_path = self.engine.find_file_by_keyword(out_dr, "No_Reverb", dr_dir)
+                     shutil.copy(dry_path, dry_final_path)
+                 except Exception as e:
+                     print(f"        ⚠️  Reverb Failed: {e}")
+                     print(f"        ⚠️  Skipping De-Reverb step (Using Ensemble Vocals as Dry).")
+                     shutil.copy(ens_path, dry_final_path)
 
         # ---------------------------------------------------------
         # [Step 3] Smart Gate
@@ -137,7 +142,7 @@ class ProcessingPipeline:
             shutil.copy(clean_path, final_dest)
 
         # ---------------------------------------------------------
-        # [Step 4] Karaoke Split
+        # [Step 4] Karaoke Split (Fixed UVR-MDX-Karaoke)
         # ---------------------------------------------------------
         main_out = os.path.join(song_out_dir, '04_main_vocal.wav')
         back_out = os.path.join(song_out_dir, '04_backing_vocal.wav')
@@ -148,22 +153,36 @@ class ProcessingPipeline:
             else:
                 print(f"    [4/4] Main/Backing Split...")
                 
+                # 1. RoFormer (Robust)
                 dir_rof = os.path.join(raw_dir, "04_A_RoF")
                 main_rof, back_rof = self._get_or_run_karaoke(
-                    clean_path, dir_rof, self.cfg['models']['karaoke_rof']
+                    clean_path, dir_rof, self.cfg['models']['karaoke_rof'],
+                    is_mdx=False
                 )
 
+                # 2. MDX (Needs 512 override)
                 dir_mdx = os.path.join(raw_dir, "04_B_MDX")
-                main_mdx, back_mdx = self._get_or_run_karaoke(
-                    clean_path, dir_mdx, self.cfg['models']['karaoke_mdx']
-                )
+                try:
+                    main_mdx, back_mdx = self._get_or_run_karaoke(
+                        clean_path, dir_mdx, self.cfg['models']['karaoke_mdx'],
+                        is_mdx=True
+                    )
+                    
+                    # Both successful -> Mix
+                    print(f"        🔹 Mixing Karaoke Stems...")
+                    w_rof = self.cfg['weights']['karaoke']['RoFormer']
+                    w_mdx = self.cfg['weights']['karaoke']['MDX']
+                    
+                    main_final, _ = mix_weighted(main_rof, main_mdx, w_rof, w_mdx, sr)
+                    back_final, _ = mix_weighted(back_rof, back_mdx, w_rof, w_mdx, sr)
 
-                print(f"        🔹 Mixing Karaoke Stems...")
-                w_rof = self.cfg['weights']['karaoke']['RoFormer']
-                w_mdx = self.cfg['weights']['karaoke']['MDX']
-
-                main_final, _ = mix_weighted(main_rof, main_mdx, w_rof, w_mdx, sr)
-                back_final, _ = mix_weighted(back_rof, back_mdx, w_rof, w_mdx, sr)
+                except Exception as e:
+                    print(f"        ⚠️  MDX Karaoke Failed: {e}")
+                    print(f"        ⚠️  Falling back to RoFormer output only.")
+                    main_final, _ = librosa.load(main_rof, sr=sr, mono=False)
+                    back_final, _ = librosa.load(back_rof, sr=sr, mono=False)
+                    if main_final.ndim == 1: main_final = np.stack([main_final, main_final])
+                    if back_final.ndim == 1: back_final = np.stack([back_final, back_final])
 
                 sf.write(main_out, main_final.T, sr)
                 sf.write(back_out, back_final.T, sr)
@@ -175,7 +194,7 @@ class ProcessingPipeline:
             
         return song_out_dir
 
-    def _get_or_run_karaoke(self, input_path, work_dir, model_file):
+    def _get_or_run_karaoke(self, input_path, work_dir, model_file, is_mdx=False):
         existing_files = []
         if os.path.exists(work_dir):
             existing_files = [os.path.join(work_dir, f) for f in os.listdir(work_dir) if f.endswith('.wav')]
@@ -185,5 +204,17 @@ class ProcessingPipeline:
             return self.engine.identify_stems([os.path.basename(f) for f in existing_files], work_dir, input_path)
         else:
             print(f"        🔹 Running {os.path.basename(work_dir)}...")
-            out_files = self.engine.separate(input_path, work_dir, model_file)
+            
+            # [FIX] MDX Karaoke 모델도 512가 필요함
+            overrides = {}
+            if is_mdx:
+                overrides = {
+                    "mdx_params": {
+                        "segment_size": 512, 
+                        "overlap": 0.25, 
+                        "batch_size": 1
+                    }
+                }
+                
+            out_files = self.engine.separate(input_path, work_dir, model_file, **overrides)
             return self.engine.identify_stems(out_files, work_dir, input_path)
